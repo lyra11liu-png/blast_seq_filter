@@ -11,7 +11,7 @@ detect ambiguities/mismatches before downloading genomes.
             status(OK/HIGHER_TAXON/AMBIGUOUS/NOT_FOUND), candidates_json, notes
 """
 
-import os, time, json, re, argparse, pathlib, csv   # ← 加了 csv
+import os, time, json, re, argparse, pathlib, csv
 import pandas as pd
 import requests
 
@@ -50,7 +50,7 @@ def load_manifest(path: str) -> pd.DataFrame:
         raise SystemError("Input must have a 'latin_name' column.")
     if "synonyms" not in df.columns:
         df["synonyms"] = ""
-    # 轻度清洗
+
     df["latin_name"] = df["latin_name"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
     df["synonyms"]   = df["synonyms"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
     return df
@@ -123,7 +123,7 @@ def resolve_one_name(latin_name: str, synonyms: str, sleep_between=0.2):
         info = esummary_tax(tid)
         if info:
             cand.append(info)
-        time.sleep(sleep_between)  # 礼貌限速
+        time.sleep(sleep_between)
     species_like = [c for c in cand if str(c.get("rank","")).lower() in ("species","subspecies")]
     if len(species_like) == 1:
         best = species_like[0]; status = "OK"
@@ -147,7 +147,6 @@ def main():
     total = len(df)
     start = time.time()
 
-    # —— 进度友好：逐条写出 + 控制台打印 ——
     with open(args.out, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["latin_input","synonyms_input","best_taxid","best_rank","best_name",
@@ -166,15 +165,14 @@ def main():
             except Exception as e:
                 row = [latin, syns, "", "", "", "ERROR", "[]", str(e)]
             w.writerow(row)
-            fh.flush()  # 立刻落盘，便于监控文件行数
+            fh.flush() 
 
-            # 控制台进度
             done = i + 1
             elapsed = time.time() - start
             rate = done / elapsed if elapsed > 0 else 0.0
             print(f"[{done}/{total}] {latin} -> {row[5]}  | {rate:.2f} rec/s", flush=True)
 
-    print(f"✅ wrote {args.out}")
+    print(f"wrote {args.out}")
 
 if __name__ == "__main__":
     main()
