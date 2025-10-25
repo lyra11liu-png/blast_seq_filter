@@ -6,7 +6,7 @@ set -euo pipefail
 ENV_NAME="filterbt"
 PYVER="3.10"
 
-# Ensure conda is available in this shell
+# Ensure conda is available in the shell
 if ! command -v conda >/dev/null 2>&1; then
   if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
     source "$HOME/miniconda3/etc/profile.d/conda.sh"
