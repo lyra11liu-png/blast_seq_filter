@@ -41,6 +41,8 @@ def main():
                     help="hybrid模式下：病毒序列长度下限（默认200）")
     ap.add_argument("--microbe-slen-min", type=int, default=1000,
                     help="hybrid模式下：细菌/真菌/古菌序列长度下限（默认1000）")
+    ap.add_argument("--microbe-refseq-fallback", type=int, default=200,
+                help="微生物物种在 RefSeq-only 下命中条目 <该阈值时，自动放宽到 GenBank+RefSeq（默认200）")
 
     ap.add_argument("--resume", action="store_true", help="断点续传并跳过已完整文件")
     ap.add_argument("--tolerance", type=float, default=0.02, help="判定完整的容忍度（默认 2%）")
@@ -51,9 +53,13 @@ def main():
     ap.add_argument("--dedup", action="store_true", help="合并后再做序列去冗余（优先 cd-hit-est 0.99）")
     ap.add_argument("--build-db", action="store_true", help="用 makeblastdb 生成核酸库")
     ap.add_argument("--makeblastdb", default=None, help="makeblastdb 路径（不填将从环境中查找）")
-
+    ap.add_argument("--dbdir", default=None,
+                help="可选：把 makeblastdb 的输出前缀放到这个目录（默认放各 group 子目录）")
+    
     args = ap.parse_args()
     out_base = ensure_dir(pathlib.Path(args.outdir).resolve())
+    db_dir = pathlib.Path(args.dbdir).resolve() if args.dbdir else None
+    if db_dir: ensure_dir(db_dir)
     
     # ===== Collect tasks =====
     tasks = []
@@ -83,7 +89,8 @@ def main():
                 tolerance=args.tolerance,
                 hybrid=args.hybrid,
                 virus_slen_min=args.virus_slen_min,
-                microbe_slen_min=args.microbe_slen_min
+                microbe_slen_min=args.microbe_slen_min,
+                microbe_refseq_fallback=args.microbe_refseq_fallback
             ) for tx,label in tasks]
             for fu in as_completed(futs):
                 try:
@@ -103,7 +110,7 @@ def main():
                 r["file"], r["taxmap"], str(r["count"]), str(r.get("expected",0)),
                 str(r.get("skipped",False)), f'{r["seconds"]:.1f}', str(r.get("incomplete",False))
             ]) + "\n")
-    log(f"Have writtenn stastics:{stat}")
+    log(f"Wrote stastics:{stat}")
     
     miss = out_base / "incomplete_or_missing.tsv"
     with open(miss, "w", encoding="utf-8") as f:
@@ -123,26 +130,41 @@ def main():
         mk = ensure_makeblastdb(args.makeblastdb) if args.build_db else None
         for g in GROUPS:
             gdir = out_base / g
-            if not gdir.exists(): continue
+            if not gdir.exists():
+                continue
+
             merged = gdir / f"{g}_all.fasta"
             merged_tax = gdir / f"{g}_all.taxmap.tsv"
             log(f"[Merge] {g} -> {merged.name} / {merged_tax.name}")
+
+            # 1) 合并
             n_in, n_out = merge_group_fastas(gdir, merged)
             n_map = merge_group_taxmaps(gdir, merged_tax)
-            log(f"  Merge finished: input={n_in}, output={n_out}；taxmap={n_map}")
+            log(f"  Merge finished: input={n_in}, output={n_out}; taxmap={n_map}")
 
-            dedup_out = gdir / f"{g}_all.dedup.fa"
+            # 2) 去重（cd-hit-est 优先，缺失则回退哈希去重）
+            dedup_out = merged
+            tax_for_db = merged_tax
             if args.dedup:
-                if not dedup_by_cd_hit(merged, dedup_out, threads=max(1,args.threads), c=0.99):
-                    log("cd-hit not found")
+                dedup_out = gdir / f"{g}_all.dedup.fasta"
+                if not dedup_by_cd_hit(merged, dedup_out, threads=max(1, args.threads), c=0.99):
+                    log("cd-hit-est not found, fallback to hash-dedup")
                     _ = dedup_by_hash(merged, dedup_out)
-            else:
-                dedup_out = merged
 
+                # taxmap 只保留 dedup 后仍存在的 seqid
+                from merge_build import filter_taxmap_by_fasta
+                filtered_tax = gdir / f"{g}_all.dedup.taxmap.tsv"
+                filter_taxmap_by_fasta(dedup_out, merged_tax, filtered_tax)
+                tax_for_db = filtered_tax
+
+            # 3) 建库
             if args.build_db:
-                prefix = gdir / f"{g}_blastdb"
+                if db_dir:
+                    prefix = db_dir / f"{g}_blastdb"
+                else:
+                    prefix = gdir / f"{g}_blastdb"
                 title  = f"{g}_nucl"
-                build_blast_db(mk, dedup_out, merged_tax, prefix, title)
+                build_blast_db(mk, dedup_out, tax_for_db, prefix, title)
 
     log("ALL DONE!")
 
