@@ -88,3 +88,26 @@ def count_fasta_records_safe(part_path: str) -> int:
 
 def sha1seq(s: str) -> str:
     return hashlib.sha1(s.encode("ascii","ignore")).hexdigest()
+
+# ========= .part 文件工具：把 .xxxx.part 转成 xxxx.part，便于断点续传 =========
+def reveal_hidden_part(p: pathlib.Path) -> pathlib.Path:
+    """
+    如果目标 .part 不存在而其“隐藏同名”（.filename.part）存在，就把隐藏文件改名为可见的 .part。
+    如果已存在同名 .part，则保留体积更大的那个。
+    """
+    try:
+        if p.exists():
+            return p
+        hidden = p.with_name("." + p.name)
+        if hidden.exists():
+            # 若已有非隐藏 .part，保留更大的
+            if p.exists():
+                if hidden.stat().st_size > p.stat().st_size:
+                    hidden.replace(p)
+                else:
+                    hidden.unlink(missing_ok=True)
+            else:
+                hidden.replace(p)
+    except Exception:
+        pass
+    return p
