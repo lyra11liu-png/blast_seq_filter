@@ -52,6 +52,26 @@ FA_EXT = (".fa", ".fna", ".fasta", ".fas")
 NOW = lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 # -------------------- 基础工具 --------------------
+# 允许的碱基集合（建库最稳妥只保留 A/C/G/T/N）
+_ALLOWED = set("ACGTN")
+
+def sanitize_and_flag(seq: str):
+    """
+    返回: (clean_seq, bad_pos, bad_chars)
+      - clean_seq: 清洗后的序列（U->T，其它->N）
+      - bad_pos:   原序列里非法字符的位置(0-based)
+      - bad_chars: 这些非法字符的去重集合（列表）
+    """
+    raw = seq.upper().replace("U", "T")
+    bad_pos = [i for i, ch in enumerate(raw) if ch not in _ALLOWED]
+    if bad_pos:
+        clean = "".join((ch if ch in _ALLOWED else "N") for ch in raw)
+        bad_chars = sorted(set(raw[i] for i in bad_pos))
+    else:
+        clean = raw
+        bad_chars = []
+    return clean, bad_pos, bad_chars
+
 def _sanitize_dna(seq: str) -> str:
     s = seq.upper().replace("U", "T")
     import re
@@ -64,6 +84,53 @@ def write_fasta_clean(fp: str, records):
             w.write(">"+h+"\n")
             for i in range(0, len(cs), 60):
                 w.write(cs[i:i+60]+"\n")
+                
+# ==== 短ID与精简标题工具 ====
+MAX_STITLE_LEN = int(os.getenv("MAX_STITLE_LEN", "240"))
+
+def _short_id(cat: str, idx: int, seq: str) -> str:
+    """≤50字符的稳定短ID：<cat>_<7位序号>_<sha10>"""
+    h10 = hashlib.sha1(seq.encode("utf-8")).hexdigest()[:10]
+    base = re.sub(r"[^A-Za-z0-9_]", "_", cat)[:12]
+    return f"{base}_{idx:07d}_{h10}"  # e.g. bacteria_0001234_ab12cd34ef
+
+_ACC_RE = re.compile(r'\b([A-Z]{1,3}\d{2,8}\.\d+|[A-Z]{2}_\d+\.\d+)\b')
+
+def _parse_safe_id(safe_id: str) -> Tuple[str, str]:
+    """
+    你的 merge 阶段把 header 写成：
+        safe_id = "<unit>|<file>|<safe(orig)>"
+    这里取出 unit 与 file（如果没写也容错）。
+    """
+    parts = safe_id.split("|", 2)
+    unit = parts[0] if parts else ""
+    srcf = parts[1] if len(parts) > 1 else ""
+    return unit, srcf
+
+def _compact_stitle(unit: str, srcf: str, orig: str) -> str:
+    """
+    生成精简 stitle："<物种> | file=<file> | acc=<ACC> | <注释>"
+    - 去掉重复的物种名前缀
+    - 压缩空白并截断到 MAX_STITLE_LEN
+    """
+    species = unit.replace("_", " ").strip()
+    acc = ""
+    m = _ACC_RE.search(orig)
+    if m: acc = m.group(1)
+
+    # 注释 = 去掉开头 accession、去掉与物种重复的冗余前缀
+    anno = re.sub(r'^[^\s]+\s*', '', orig).strip()
+    if anno.lower().startswith(species.lower()):
+        anno = anno[len(species):].lstrip(" :,-")
+
+    parts = [species]
+    if srcf: parts.append(f"file={Path(srcf).name}")
+    if acc:  parts.append(f"acc={acc}")
+    if anno: parts.append(re.sub(r'\s+', ' ', anno))
+    stitle = " | ".join(parts).strip()
+    if len(stitle) > MAX_STITLE_LEN:
+        stitle = stitle[:MAX_STITLE_LEN-3] + "..."
+    return stitle
 
 def need(cmd: str) -> Optional[str]:
     return shutil.which(cmd)
@@ -380,99 +447,157 @@ def mmseqs_near(in_fa: Path, out_fa: Path, tmpdir: Path,
     chosen = sorted(set(chosen))
     write_fasta(out_fa.as_posix(), [(H[i], S[i]) for i in chosen])
 
-def blast_near(in_fa: Path, out_fa: Path, pid: float, qcov: float, threads: int,
+# === 替换原来的 blast_near(...) 整个函数 ===
+def blast_near(in_fa: Path, out_fa: Path, tmpdir: Path,
+               pid: float, qcov: float, threads: int,
                sid: int, con, pbar_desc: str):
+    """
+    用 batched BLAST 做“近重复”。
+    临时 subject（kept.fa/kept_db）全部写入 tmpdir（来自 --tmp-root），
+    若 makeblastdb 失败自动回退到 -subject FASTA。
+    """
+    ensure_dir(tmpdir)
+
+    # 读取并按“更完整/更长优先”排序
     recs = list(read_fasta_lazy(in_fa.as_posix()))
-    # 完整/更长优先做代表
     recs.sort(key=lambda x: (not is_complete_header(x[0]), -len(x[1])))
 
-    tmp = out_fa.with_suffix(".tmp")
-    kept: List[Tuple[str,str]] = []
-    kept_file = tmp.as_posix()+".kept.fa"
+    # 统一的物种本地临时前缀（在 tmpdir 里）
+    tmp_base = (tmpdir / "blast").as_posix()
+    kept_file = tmp_base + ".kept.fa"
+    dbpref    = tmp_base + ".keptdb"
 
-    def blast_equiv(q: Tuple[str, str]) -> Optional[str]:
-        # 中断时立刻放弃本次比对
-        if STOP:
-            return None
+    # —— 可调参数（环境变量覆盖）——
+    BATCH = int(os.getenv("BLAST_BATCH", "256"))
+    WORD  = int(os.getenv("BLAST_WORD",  "48"))
+    UNGAP = os.getenv("BLAST_UNGAPPED", "1").lower() in ("1","true","yes")
+    USE_DB_GLOBAL = os.getenv("BLAST_SUBJECT_DB", "0").lower() in ("1","true","yes")
+    DB_REFRESH = int(os.getenv("BLAST_DB_REFRESH", "5000"))
+    SUBJECT_REFRESH = int(os.getenv("BLAST_SUBJECT_REFRESH", "400"))
+    DB_MIN_SEQS = int(os.getenv("BLAST_DB_MIN_SEQS", "10000"))
+    DB_MIN_BYTES = int(os.getenv("BLAST_DB_MIN_BYTES", str(400*1024*1024)))
+    CLEAN_TMP = os.getenv("BLAST_CLEAN_TMP", "1").lower() in ("1","true","yes")
 
-        qfa = tmp.as_posix() + ".q.fa"
+    def _write_kept():
+        write_fasta(kept_file, kept)
+
+    def _make_db() -> bool:
+        # 临时 DB 不用 -parse_seqids，鲁棒性更好
         try:
-            write_fasta(qfa, [q])
-
-            cmd = [
-                "blastn", "-task", "megablast",
-                "-query", qfa,
-                "-subject", kept_file,          # 直接用当前保留集合作 subject
-                "-evalue", "1e-20",
-                "-max_hsps", "1", "-max_target_seqs", "1",
-                "-num_threads", str(max(1, threads)),
-                "-outfmt", "6 qseqid sseqid length pident qlen slen"
-            ]
-
-            # 单次比对超时时间（秒），可用环境变量覆盖，默认 600s
-            timeout_sec = int(os.environ.get("BLAST_EQUIV_TIMEOUT", "600"))
-
-            try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
-            except subprocess.TimeoutExpired:
-                # 超时直接视为“无命中”，返回 None
-                return None
-
+            for ext in (".nhr",".nin",".nsq"):
+                p = dbpref + ext
+                if os.path.exists(p): os.remove(p)
+            proc = subprocess.run(
+                ["makeblastdb","-in", kept_file, "-dbtype","nucl", "-out", dbpref],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
             if proc.returncode != 0:
-                # BLAST 异常，按“无命中”处理即可（避免打断主流程）
-                return None
+                sys.stderr.write(f"[WARN] makeblastdb(kept_db) 失败，回退 FASTA subject。"
+                                 f" stderr: {proc.stderr.splitlines()[-1][:300]}\n")
+                return False
+            return True
+        except Exception as e:
+            sys.stderr.write(f"[WARN] makeblastdb(kept_db) 异常：{e}，回退 FASTA subject。\n")
+            return False
 
-            out = proc.stdout.strip()
-            if not out:
-                return None
+    def _use_db_now() -> bool:
+        try:
+            kb = os.path.getsize(kept_file)
+        except FileNotFoundError:
+            kb = 0
+        return USE_DB_GLOBAL and (len(kept) >= DB_MIN_SEQS or kb >= DB_MIN_BYTES)
 
-            # 只看第一条
-            parts = out.splitlines()[0].split("\t")
-            if len(parts) < 6:
-                return None
+    def _blast_batch(batch):
+        if not batch:
+            return {}
+        qfa = tmp_base + ".q.fa"
+        write_fasta(qfa, batch)
+        cmd = [
+            "blastn","-task","megablast",
+            "-query", qfa,
+            "-evalue","1e-20",
+            "-max_hsps","1","-max_target_seqs","1",
+            "-num_threads", str(max(1, threads)),
+            "-dust","no","-soft_masking","false",
+            "-perc_identity", f"{pid*100:.3f}",
+            "-word_size", str(WORD),
+            "-outfmt","6 qseqid sseqid length pident qlen slen"
+        ]
+        if UNGAP: cmd.append("-ungapped")
+        if use_db_local and all(os.path.exists(dbpref+e) for e in (".nhr",".nin",".nsq")):
+            cmd += ["-db", dbpref]
+        else:
+            cmd += ["-subject", kept_file]
 
-            _, sid_h, L, PID, QL, SL = parts[:6]
-            L   = float(L); PID = float(PID)
-            QL  = float(QL); SL  = float(SL)
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        hits = {}
+        if proc.returncode == 0 and proc.stdout:
+            for ln in proc.stdout.splitlines():
+                parts = ln.split("\t")
+                if len(parts) < 6: continue
+                qid, sid_h, L, PID, QL, SL = parts[:6]
+                L=float(L); PID=float(PID); QL=float(QL); SL=float(SL)
+                if (PID/100.0) >= pid and (L/QL) >= qcov and SL >= QL:
+                    hits[qid.split()[0]] = (sid_h, L, PID, QL, SL)
+        try: os.remove(qfa)
+        except: pass
+        return hits
 
-            # 条件：相似度与覆盖满足，且 subject 不短于 query（短序列被长序列覆盖）
-            if (PID/100.0) >= pid and (L/QL) >= qcov and SL >= QL:
-                return sid_h
-            return None
+    # 初始化 kept
+    kept: List[Tuple[str,str]] = []
+    if not recs:
+        write_fasta(out_fa.as_posix(), [])
+        return
+    kept.append(recs[0]); _write_kept()
+    log_seq(con, sid, recs[0][0], len(recs[0][1]), sha1(recs[0][1]), "kept", "near_seed", None)
 
-        finally:
-            # 清理 query 临时文件
-            try:
-                if os.path.exists(qfa):
-                    os.remove(qfa)
-            except Exception:
-                pass
+    use_db_local = False
+    accepted = 1
+    bar = tqdm(total=len(recs)-1, desc=pbar_desc, unit="seq", leave=False)
+    batch: List[Tuple[str,str]] = []
 
-    bar = tqdm(recs, desc=pbar_desc, unit="seq", leave=False)
-    for h, s in bar:
-        if STOP:
-            break
-        if not kept:
-            kept.append((h, s))
-            write_fasta(kept_file, kept)
-            log_seq(con, sid, h, len(s), sha1(s), "kept", "near_seed", None)
-            continue
+    for h, s in recs[1:]:
+        batch.append((h, s))
+        if len(batch) >= BATCH:
+            if not use_db_local and _use_db_now():
+                use_db_local = _make_db()
+            hits = _blast_batch(batch)
+            for h2, s2 in batch:
+                tk = h2.split()[0]
+                if tk in hits:
+                    log_seq(con, sid, h2, len(s2), sha1(s2), "dropped", "near_dup", hits[tk][0])
+                else:
+                    kept.append((h2, s2))
+                    log_seq(con, sid, h2, len(s2), sha1(s2), "kept", "near_keep", None)
+                    accepted += 1
+                    if use_db_local and (accepted % DB_REFRESH == 0):
+                        _write_kept(); use_db_local = _make_db()
+                    elif (not use_db_local) and (accepted % SUBJECT_REFRESH == 0):
+                        _write_kept()
+                bar.update(1)
+            batch.clear()
 
-        hit = blast_equiv((h, s))
-        if hit is not None:
-            log_seq(con, sid, h, len(s), sha1(s), "dropped", "near_dup", hit)
-            continue
-
-        kept.append((h, s))
-        if len(kept) % 20 == 1:                          # 适度刷新 subject
-            write_fasta(kept_file, kept)
-        log_seq(con, sid, h, len(s), sha1(s), "kept", "near_keep", None)
+    if batch:
+        if not use_db_local and _use_db_now():
+            use_db_local = _make_db()
+        hits = _blast_batch(batch)
+        for h2, s2 in batch:
+            tk = h2.split()[0]
+            if tk in hits:
+                log_seq(con, sid, h2, len(s2), sha1(s2), "dropped", "near_dup", hits[tk][0])
+            else:
+                kept.append((h2, s2))
+                log_seq(con, sid, h2, len(s2), sha1(s2), "kept", "near_keep", None)
+        bar.update(len(batch))
 
     write_fasta(out_fa.as_posix(), kept)
-    if os.path.exists(kept_file): os.remove(kept_file)
-    if os.path.exists(tmp.as_posix()):
-        try: os.remove(tmp.as_posix())
-        except: pass
+
+    # 可选清理 tmp
+    if CLEAN_TMP:
+        for suf in (".kept.fa",".keptdb.nhr",".keptdb.nin",".keptdb.nsq",".q.fa"):
+            p = tmp_base + suf
+            try: os.remove(p)
+            except: pass
 
 # -------------------- 合并(带进度) --------------------
 def merge_with_progress(unit: Path, fas: List[Path], merged_fp: Path, species_tag: str, map_fp: Path):
@@ -501,16 +626,161 @@ def merge_with_progress(unit: Path, fas: List[Path], merged_fp: Path, species_ta
                     if total_bytes>0: bar.update(len(line.encode("utf-8")))
     bar.close()
 
+def write_cat_clean_with_short_ids(cat: str,
+                                   dedup_fas: List[Path],
+                                   out_fa: Path,
+                                   map_tsv: Path):
+    """
+    把各物种 *.dedup.fa 聚合为 <cat>.clean.fa，写短ID（≤50），并输出两份报告：
+      - <cat>.idmap.tsv  : 短ID -> 原始信息映射
+      - <cat>.bad.tsv    : 发现非法字符的序列明细
+      - <cat>.bad.fa     : 问题序列的【原始序列】合集（清洗前）
+    """
+    bad_tsv = out_fa.with_suffix(".bad.tsv")
+    bad_fa  = out_fa.with_suffix(".bad.fa")
+    BAD_PRINT = int(os.getenv("BAD_PRINT", "10"))  # 终端最多打印多少条问题记录
+
+    # 估算进度
+    total_bytes = 0
+    for fa in dedup_fas:
+        try: total_bytes += fa.stat().st_size
+        except: pass
+    bar = tqdm(total=total_bytes if total_bytes > 0 else None,
+               desc=f"[{cat}] 聚合(clean.fa)", unit="B", unit_scale=True, leave=False)
+
+    # 小工具：从 safe_id 拆出 unit 与源文件名（如果你已有同名函数，可删掉此实现）
+    def _parse_safe_id(safe_id: str):
+        parts = safe_id.split("|", 2)
+        unit = parts[0] if len(parts) > 0 else "unit"
+        srcf = parts[1] if len(parts) > 1 else "file"
+        return unit, srcf
+
+    # 生成短ID（如果你文件里已有 _short_id/_compact_stitle，请继续沿用原实现）
+    def _short_id(cat: str, idx: int, seq: str) -> str:
+        h = hashlib.sha1(seq.encode("utf-8")).hexdigest()[:10]
+        sid = f"{safe(cat)}_{idx:08d}_{h}"
+        return sid[:50]
+
+    def _compact_stitle(unit: str, srcf: str, orig: str, maxlen: int = 180) -> str:
+        base = f"{unit} {srcf}"
+        if orig:
+            base = f"{base} | {orig}"
+        return (base[:maxlen]).rstrip()
+
+    bad_count = 0
+    printed   = 0
+    idx = 0
+
+    with open(out_fa, "w") as w_clean, \
+         open(map_tsv, "w") as w_map, \
+         open(bad_tsv, "w") as w_bad, \
+         open(bad_fa, "w") as w_badfa:
+
+        w_map.write("short_id\tcategory\tunit\tfile\torig_header\n")
+        w_bad.write("short_id\tlen\tbad_cnt\tbad_chars\tfirst_10_pos\tcategory\tunit\tfile\torig_header\n")
+
+        for fa in dedup_fas:
+            consumed_bytes = 0
+            for h, s in read_fasta_lazy(fa.as_posix()):
+                idx += 1
+                # 拆 safe_id 与原始标题
+                parts = h.split(" ", 1)
+                safe_id = parts[0]
+                orig    = parts[1] if len(parts) > 1 else ""
+                unit, srcf = _parse_safe_id(safe_id)
+
+                # 清洗 + 记录问题
+                clean, bad_pos, bad_chars = sanitize_and_flag(s)
+                sid    = _short_id(cat, idx, clean)
+                stitle = _compact_stitle(unit, srcf, orig)
+
+                # 写 clean.fa（短ID + 精简标题）
+                w_clean.write(">"+sid+" "+stitle+"\n")
+                for i in range(0, len(clean), 60):
+                    w_clean.write(clean[i:i+60]+"\n")
+
+                # 写映射
+                w_map.write(f"{sid}\t{cat}\t{unit}\t{srcf}\t{h}\n")
+
+                # 如果有非法字符，写 bad.tsv 与 bad.fa（原始序列）
+                if bad_pos:
+                    bad_count += 1
+                    first10 = ",".join(str(p) for p in bad_pos[:10])
+                    chars   = "".join(bad_chars)
+                    w_bad.write(f"{sid}\t{len(s)}\t{len(bad_pos)}\t{chars}\t{first10}\t{cat}\t{unit}\t{srcf}\t{h}\n")
+                    w_badfa.write(">"+sid+" "+stitle+" [RAW]\n")
+                    for i in range(0, len(s), 60):
+                        w_badfa.write(s[i:i+60]+"\n")
+
+                    # 终端打印前 BAD_PRINT 条
+                    if printed < BAD_PRINT:
+                        sys.stderr.write(
+                            f"[BAD] {cat}/{unit}: {sid} len={len(s)} bad={len(bad_pos)} chars={chars} pos={first10}\n"
+                        )
+                        printed += 1
+
+                # 粗略推进进度（以原长度近似）
+                if total_bytes:
+                    consumed_bytes += len(h) + 1 + len(s) + (len(s)//60 + 1)
+
+            if total_bytes:
+                try:
+                    bar.update(min(consumed_bytes, fa.stat().st_size))
+                except:
+                    bar.update(consumed_bytes)
+
+    bar.close()
+    if bad_count:
+        sys.stderr.write(f"[AGG] {cat}: 发现 {bad_count} 条含非法字符的序列；已写 {bad_tsv.name} / {bad_fa.name}\n")
+    else:
+        sys.stderr.write(f"[AGG] {cat}: 未发现非法字符序列。\n")
+
 # -------------------- 建库 --------------------
 def build_db(cat: str, cat_clean_fa: Path, dbdir: Path):
     ensure_dir(dbdir)
     outbase = dbdir/safe(cat)
-    rc = run(["makeblastdb","-in",cat_clean_fa.as_posix(),"-dbtype","nucl",
-              "-parse_seqids","-hash_index","-out",outbase.as_posix()])
-    if rc!=0: raise RuntimeError(f"makeblastdb 失败: {cat}")
+    logfp   = outbase.as_posix()+".makedb.log"
+
+    total = os.path.getsize(cat_clean_fa.as_posix())
+    bar = tqdm(total=total, desc=f"[{cat}] 建库(makeblastdb)", unit="B", unit_scale=True, leave=False)
+
+    def _produced_bytes():
+        s = 0
+        for ext in (".nhr",".nin",".nsq"):
+            p = outbase.as_posix()+ext
+            if os.path.exists(p): s += os.path.getsize(p)
+        return s
+
+    # 先尝试 parse_seqids（依赖我们写入的“短ID”）
+    cmd = ["makeblastdb","-in",cat_clean_fa.as_posix(),"-dbtype","nucl",
+           "-parse_seqids","-hash_index","-out",outbase.as_posix()]
+    proc = subprocess.Popen(cmd, stdout=open(logfp,"w"),
+                            stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        while True:
+            rc = proc.poll()
+            bar.n = min(_produced_bytes(), total)
+            bar.refresh()
+            if rc is not None:
+                break
+            time.sleep(0.5)
+    finally:
+        bar.close()
+
+    if proc.returncode != 0:
+        sys.stderr.write(f"[WARN] parse_seqids 失败，回退不解析ID：{cat}\n")
+        # 清掉半成品
+        for ext in (".nhr",".nin",".nsq"):
+            try: os.remove(outbase.as_posix()+ext)
+            except: pass
+        rc = run(["makeblastdb","-in",cat_clean_fa.as_posix(),
+                  "-dbtype","nucl","-out",outbase.as_posix()])
+        if rc!=0: raise RuntimeError(f"makeblastdb 失败: {cat}")
+
     ali = need("blastdb_aliastool")
     if ali:
-        subprocess.run([ali,"-dbtype","nucl","-dblist",outbase.as_posix(),"-out",outbase.as_posix()+".alias"])
+        subprocess.run([ali,"-dbtype","nucl","-dblist",outbase.as_posix(),
+                        "-out",outbase.as_posix()+".alias"])
         nal = outbase.as_posix()+".nal"; nlq = outbase.as_posix()+".nlq"
         try:
             if os.path.islink(nlq) or os.path.exists(nlq): os.remove(nlq)
@@ -584,10 +854,12 @@ def process_one_unit(args, con, category: str, unit: Path, method: str, outdir: 
                             species_tag=f"{category}:{unit_tag}")
             except Exception as e:
                 sys.stderr.write(f"[WARN] {category}/{unit_tag}: MMseqs失败，回退BLAST：{e}\n")
-                blast_near(phase1, out_fa, args.pid, args.qcov, args.threads_per_task, sid, con,
+                blast_near(phase1, out_fa, tmp_root/"blast", args.pid, args.qcov, 
+                           args.threads_per_task, sid, con,
                            pbar_desc=f"[{category}:{unit_tag}] 近重复(BLAST)")
         else:
-            blast_near(phase1, out_fa, args.pid, args.qcov, args.threads_per_task, sid, con,
+            blast_near(phase1, out_fa, tmp_root/"blast", args.pid, args.qcov, 
+                       args.threads_per_task, sid, con,
                        pbar_desc=f"[{category}:{unit_tag}] 近重复(BLAST)")
     except Exception as e:
         sys.stderr.write(f"[ERROR] {category}/{unit_tag}: {e}\n")
@@ -689,15 +961,13 @@ def main():
         cleaned = [p for p in results if isinstance(p, Path) and p and p.exists()]
         if cleaned:
             cat_clean = outdir/f"{safe(cat)}.clean.fa"
-            with open(cat_clean, "w") as w:
-                for fa in cleaned:
-                    for h,s in read_fasta_lazy(fa.as_posix()):
-                        w.write(">"+h+"\n")
-                        for i in range(0, len(s), 60): w.write(s[i:i+60]+"\n")
+            cat_map   = outdir/f"{safe(cat)}.idmap.tsv"
+            write_cat_clean_with_short_ids(cat, cleaned, cat_clean, cat_map)
             build_db(cat, cat_clean, dbdir)
             sys.stderr.write(f"[OK] {cat} 已建库：{(dbdir/safe(cat)).as_posix()}.*\n")
         else:
             sys.stderr.write(f"[WARN] {cat} 无可聚合结果，跳过建库。\n")
+
 
     export_tsv(con, outdir)
     sys.stderr.write(f"\n[REPORT] kept.tsv / dropped.tsv 导出完毕；SQLite：{(outdir/'dedup_index.sqlite').as_posix()}\n")
