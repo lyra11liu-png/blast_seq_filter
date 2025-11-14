@@ -839,7 +839,7 @@ def process_one_unit(args, con, category: str, unit: Path, method: str, outdir: 
 
     # --- 根据 phase1 体积决定是否改走 BLAST ---
     size = phase1.stat().st_size
-    thresh = int(os.environ.get("MMSEQS_SWITCH_TO_BLAST_BYTES", 1_000_000_000))  # 默认 1GiB
+    thresh = int(os.environ.get("MMSEQS_SWITCH_TO_BLAST_BYTES", 1_000_000_000))
     method_local = method
     if method == "mmseqs" and size >= thresh:
         sys.stderr.write(f"[INFO] {category}/{unit_tag}: phase1={size/1e9:.2f} GB >= {thresh/1e9:.2f} GB; 改用 BLAST\n")
@@ -916,7 +916,6 @@ def main():
                 raise
         raise
 
-    # main() 里改成：
     with _DB_LOCK:
         _exec_retry(con, "INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("method", method))
         _exec_retry(con, "INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("pid", str(args.pid)))
