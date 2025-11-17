@@ -344,7 +344,7 @@ def main():
             ]) + "\n")
     log(f"已写出统计：{stat}")
 
-    # 未完成/缺失清单
+    # Loss lists
     miss_path = out_base / "incomplete_or_missing.tsv"
     with open(miss_path, "w", encoding="utf-8") as f:
         f.write("taxid\tgroup\tsci_name\trank\tfile\texpected\tcount\n")
@@ -359,7 +359,7 @@ def main():
                 ]) + "\n")
     log(f"未完成/缺失清单：{miss_path}（为空表示都正常）")
 
-    # 合并 & 建库
+    # Merge & database construst
     if args.merge or args.build_db:
         mk = ensure_makeblastdb(args.makeblastdb) if args.build_db else None
         for g in ["viruses","bacteria","fungi","archaea","other"]:
