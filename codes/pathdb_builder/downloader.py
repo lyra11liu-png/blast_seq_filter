@@ -208,7 +208,6 @@ def download_one(taxid: str, label: str, out_base: pathlib.Path,
             cur_page = max(500, cur_page // 2)
             log(f"[{taxid}] efetch retry#{attempts} page={cur_page}, start={fa_start} due to: {e}")
 
-    # 只有 .part 有内容才“晋升”为最终 .fasta；否则清理空壳，避免 0B
     if os.path.exists(fa_part):
         if os.path.getsize(fa_part) > 0:
             os.replace(str(fa_part), str(fa_path))
