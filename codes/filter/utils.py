@@ -16,7 +16,7 @@ class CommandError(RuntimeError):
     pass
 
 def run_cmd(cmd: List[str] | str,
-            logger: Optional[callable[[str], None]] = None,
+            logger: Optional[Callable[[str], None]] = None,
             shell: bool = False) -> None:
     """
     Execute external commands & directly throm exceptions when errors occur.
@@ -49,7 +49,7 @@ def run_cmd(cmd: List[str] | str,
             logger(f"[CMD DONE] {cmd}")
             
 class Timer:
-    def __init__(self, name: str, logger: Optional[callable[[str], None]] = None):
+    def __init__(self, name: str, logger: Optional[Callable[[str], None]] = None):
         self.name = name
         self.logger = logger
         self.elapsed: float = 0.0
@@ -66,10 +66,10 @@ class Timer:
             self.logger(f"[END] {self.name} elapsed {self.elapsed:.1f} s")
         return False
     
-    def default_logger_factory(log_path: str) -> Callable[[str], None]:
-        def _log(msg: str) -> None:
-            line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}"
-            print(line)
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        return _log
+def default_logger_factory(log_path: str) -> Callable[[str], None]:
+    def _log(msg: str) -> None:
+        line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+        print(line)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    return _log
