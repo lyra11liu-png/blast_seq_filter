@@ -2,13 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 run_pipeline.py
-主脚本：对一个目录下所有 BAM 文件执行：
-    1) minimap2 + samtools 去除人类序列
-    2) 对剩余 reads 在多个病原体 BLAST 库上做 BLASTn
-    3) 输出每个样本的所有命中(all_hits)和物种统计表(summary_by_species)
-       以及 taxonomy_report.tsv + 合并后的 taxonomy_summary.tsv
 
-支持可选的多进程并行，以及简单的计算时间监控。
+Main script: execute the following on all .bam files within a directory:
+  - Remove human seqs using minimap2 + samtools
+  - Perform blastn on remaining reads against multiple pathogen blast databases
+  - Output all hits per sample & species statistics table
+
+Support optional multi-process parallelism & basic computation time monitoring.
+
+Author: lyra Liu
 """
 
 from __future__ import annotations
@@ -28,51 +30,46 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--indir", required=True,
-                   help="输入 BAM 文件所在目录（会自动寻找 *.bam）")
+                   help="Enter the directory containing the .bam files.")
     p.add_argument("--bam", default=None,
-                   help="只处理指定的单个 BAM 文件（可选），给出完整路径")
+                   help="Process only the specified single .bam file, providing the full path.")
     p.add_argument("--outdir", required=True,
-                   help="输出结果目录，每个样本一个子目录")
+                   help="Output directory structure: one subdirectory per sample.")
 
-    # 人类索引
     p.add_argument("--human-index", required=True,
-                   help="minimap2 用的人类参考索引 .mmi 路径")
+                   help="minimap2 human reference index .mmi path.")
 
-    # 病原体 BLAST 数据库根目录 + 使用的前缀列表
     p.add_argument("--db-root", required=True,
-                   help="病原体 BLAST 库所在目录（里面有 viruses.nhr/bacteria.nhr 等）")
+                   help="Pathogen blast database directory.")
     p.add_argument("--db-groups", default="viruses,bacteria,fungi,mycoplasma,archaea,protozoa,helminths",
-                   help=("要使用的库前缀名，逗号分隔；"
-                         "例如 'viruses,bacteria,fungi,mycoplasma'"))
+                   help=("The prefix names of the libraries to be used."))
     p.add_argument("--idmap-root", default=None,
-                   help=("可选：分类建库生成的 <group>.idmap.tsv 所在目录；"
-                         "若不指定，将默认使用 db-root 的上一级目录下的 clean/ 子目录"))
+                   help=("Directory containing the <group>.idmap.tsv file generated during categorized database creation;"
+                         "If not specified, the default location will be the clean/subdirectory within the parent directory of db-root."))
 
-    # 外部工具
     p.add_argument("--minimap2", default="minimap2",
-                   help="minimap2 可执行文件名称或路径")
+                   help="minimap2 executable file name/path.")
     p.add_argument("--samtools", default="samtools",
-                   help="samtools 可执行文件名称或路径")
+                   help="samtools executable file name/path.")
     p.add_argument("--blastn", default="blastn",
-                   help="blastn 可执行文件名称或路径")
+                   help="blastn executable file name/path.")
 
     p.add_argument("--threads", type=int, default=8,
-                   help="每个样本内部使用的线程数（传给 minimap2 / blastn）")
+                   help="Numeber of threads used internally per sample.")
     p.add_argument("--preset", default="map-hifi",
-                   help="minimap2 预设（PacBio HiFi 用 map-hifi，ONT 可用 map-ont 等）")
+                   help="minimap2 presets.")
 
     p.add_argument("--parallel", action="store_true",
-                   help="是否并行处理多个 BAM 样本")
+                   help="Whether multiple .bam samples process in paralle.")
     p.add_argument("--jobs", type=int, default=2,
-                   help="并行时的进程数（样本数并行）")
+                   help="Number of processes in parallel.")
 
-    # ===== 新增：命中筛选阈值 =====
     p.add_argument("--min-pident", type=float, default=85.0,
-                   help="最小比对相似度（百分数，例如 85.0）")
+                   help="Mimimum matching similarity.")
     p.add_argument("--min-align-len", type=int, default=80,
-                   help="最小比对长度（bp），短于该长度的命中将被丢弃")
+                   help="Minimum match length.")
     p.add_argument("--max-hit-evalue", type=float, default=1e-20,
-                   help="最大命中 e-value（越小越严格），大于该值的命中将被丢弃")
+                   help="Maximum hit e-value.")
 
     return p.parse_args()
 
@@ -88,9 +85,6 @@ def find_bam_files(indir: str) -> List[Path]:
 
 
 def build_db_map(db_root: str, groups_str: str) -> Dict[str, str]:
-    """
-    根据 db_root + 组名列表构造 db_map: group -> db_prefix
-    """
     root = Path(db_root)
     if not root.is_dir():
         raise SystemExit(f"DB root directory not found: {db_root}")
@@ -135,7 +129,7 @@ def process_one_sample(
     max_hit_evalue: float,
 ) -> Tuple[str, Dict[str, float]]:
     """
-    单样本处理函数，用于主进程或子进程。
+    Single sample processing function for the main process / subprocess.
     """
     bam = Path(bam_path)
     sample = bam.stem
@@ -149,7 +143,7 @@ def process_one_sample(
     logger(f"[SAMPLE] {sample}")
     logger(f"[INPUT BAM] {bam_path}")
 
-    # 1. 去除人类 reads，生成 non-human FASTA
+    # Remove human reads & generate non-human .fasta files
     host_timings = bam_to_nonhuman_fasta(
         bam_path=str(bam),
         out_dir=str(sample_outdir),
@@ -162,7 +156,7 @@ def process_one_sample(
     )
     nonhuman_fa = str(sample_outdir / f"{sample}.nonhuman.fasta")
 
-    # 2. 对 non-human FASTA 在多个库上做 BLASTn（输出所有“通过筛选”的命中）
+    # Perform blastn searches on non-human fasta seqs across multiple databases.
     blast_timings = run_multi_db_blast(
         query_fa=nonhuman_fa,
         out_prefix=str(sample_outdir / sample),
@@ -176,7 +170,7 @@ def process_one_sample(
         max_hit_evalue=max_hit_evalue,
     )
 
-    # 汇总 timings
+    # Summary of timings
     timings: Dict[str, float] = {}
     timings.update(host_timings)
     timings.update(blast_timings)
@@ -185,7 +179,7 @@ def process_one_sample(
 
 def write_runtime_summary(all_timings: Dict[str, Dict[str, float]], outdir: str) -> None:
     """
-    把所有样本的耗时信息写到一个 TSV 汇总文件中，便于监控。
+    Write the timing information 4 all samples into a single .tsv summary file 4 monitoring purposes.
     """
     out_path = Path(outdir) / "runtime_summary.tsv"
     with open(out_path, "w", encoding="utf-8") as f:
@@ -197,11 +191,6 @@ def write_runtime_summary(all_timings: Dict[str, Dict[str, float]], outdir: str)
 
 
 def merge_taxonomy_reports(outdir: str) -> None:
-    """
-    把每个样本子目录下的 *.taxonomy_report.tsv 合并成一个总表：
-        outdir/taxonomy_summary.tsv
-    方便直接在 Excel 里打开。
-    """
     out_dir = Path(outdir)
     merged_path = out_dir / "taxonomy_summary.tsv"
 
@@ -215,7 +204,7 @@ def merge_taxonomy_reports(outdir: str) -> None:
             if not tax_fp.is_file():
                 continue
             with open(tax_fp, "r", encoding="utf-8") as fin:
-                header = fin.readline()  # 跳过每个文件自己的表头
+                header = fin.readline()
                 for line in fin:
                     fout.write(line)
 
@@ -237,10 +226,9 @@ def main() -> None:
         
     Path(args.outdir).mkdir(parents=True, exist_ok=True)
 
-    # 构造 group -> db_prefix 映射（一次搞好，传给每个进程）
+    # Construct the group -> db_prefix mapping.
     db_map = build_db_map(args.db_root, args.db_groups)
     
-    # 推断 idmap_root：若用户没显式指定，默认假设为 "<db-root>/../clean"
     if args.idmap_root is not None:
         idmap_root = args.idmap_root
     else:
@@ -250,7 +238,6 @@ def main() -> None:
     all_timings: Dict[str, Dict[str, float]] = {}
 
     if args.parallel:
-        # 多进程并行按样本跑
         jobs = max(1, int(args.jobs))
         print(f"Running in parallel with {jobs} processes")
         with ProcessPoolExecutor(max_workers=jobs) as ex:
@@ -282,7 +269,6 @@ def main() -> None:
                 except Exception as e:
                     print(f"[ERROR] sample {bam.name} failed: {e}")
     else:
-        # 顺序逐个样本跑，便于调试
         print("Running samples sequentially (no --parallel)")
         for bam in bams:
             try:
@@ -306,7 +292,7 @@ def main() -> None:
             except Exception as e:
                 print(f"[ERROR] sample {bam.name} failed: {e}")
 
-    # 写出整体耗时表 + 合并 tax 表
+    # Create a comprehensive timeline & merge the tax table.
     write_runtime_summary(all_timings, args.outdir)
     merge_taxonomy_reports(args.outdir)
 
