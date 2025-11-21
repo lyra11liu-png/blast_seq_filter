@@ -5,6 +5,8 @@ utils.py
 General utility functions:
 - Run external commands: minimap2/blastn/samtools
 - Simple timer 4 monitoring computation time
+
+Author: lyra Liu
 """
 from __future__ import annotations
 import subprocess
