@@ -2,8 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 host_filter.py
-用 minimap2 + samtools 从测序 BAM 文件中去除人类宿主序列，
-并把剩余 reads 导出为 FASTA，用于后续 BLAST 鉴定。
+Use minimap2 + samtools to remove human host seqs from sequencing .bam files.
+Export the remaining read as .fasta files 4 subsequent blast identification.
+
+Author: lyra Liu
 """
 
 from __future__ import annotations
@@ -16,11 +18,7 @@ from utils import run_cmd, Timer
 def fastq_to_fasta(fq_path: str, fa_path: str,
                    logger: Optional[Callable[[str], None]] = None) -> None:
     """
-    把 FASTQ 转换为 FASTA（逐行流式处理，不占太多内存）。
-
-    参数:
-        fq_path: 输入 FASTQ 文件路径
-        fa_path: 输出 FASTA 文件路径
+    Convert fastq to fasta (line-by-line streaming processing).
     """
     if logger:
         logger(f"[INFO] Convert FASTQ to FASTA: {fq_path} -> {fa_path}")
@@ -35,7 +33,6 @@ def fastq_to_fasta(fq_path: str, fa_path: str,
             plus = fin.readline()
             qual = fin.readline()
             if not qual:
-                # FASTQ 不完整
                 raise ValueError(f"Unexpected EOF in FASTQ file: {fq_path}")
             if not header.startswith("@"):
                 raise ValueError(f"Invalid FASTQ header line: {header.rstrip()}")
@@ -58,18 +55,8 @@ def bam_to_nonhuman_fasta(
     logger: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, float]:
     """
-    对单个 BAM 文件执行：
-        BAM -> 过滤出非人序列 -> FASTQ -> FASTA
-
-    步骤：
-        1) samtools fastq 把 BAM 转为 FASTQ
-        2) minimap2 比对到人类基因组 + samtools view -f4 过滤 unmapped
-        3) samtools fastq 导出非人 reads FASTQ
-        4) Python 转换为 FASTA
-
-    返回:
-        一个 dict，记录各子步骤耗时（秒），键包括:
-            'bam_to_nonhuman_fastq', 'fastq_to_fasta'
+    Perform the following steps on a single .bam file:
+        .bam -> .fastaq -> filter non-human seqs -> .fasta
     """
     bam = Path(bam_path)
     out_dir_p = Path(out_dir)
@@ -83,7 +70,7 @@ def bam_to_nonhuman_fasta(
 
     timings: Dict[str, float] = {}
 
-    # samtools fastq -> minimap2 比对 -> samtools view 过滤 unmapped -> samtools fastq 导出
+    # samtools fastq -> minimap2 align -> samtools view filter unmapped -> samtools fastq output
     pipe_cmd = (
         f"{samtools} fastq -n {bam_path} | "
         f"{minimap2} -t {threads} -ax {preset} {human_index} - | "
@@ -94,7 +81,6 @@ def bam_to_nonhuman_fasta(
         run_cmd(pipe_cmd, logger=logger, shell=True)
     timings["bam_to_nonhuman_fastq"] = t.elapsed
 
-    # 4. FASTQ -> FASTA
     with Timer("fastq_to_fasta", logger) as t:
         fastq_to_fasta(nonhuman_fq, nonhuman_fa, logger=logger)
     timings["fastq_to_fasta"] = t.elapsed
