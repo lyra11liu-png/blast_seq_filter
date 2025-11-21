@@ -1,50 +1,47 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-blast_classify.py  —— 多库 BLAST 分类（输出所有命中）
+blast_classify.py
 
-对非人 reads FASTA 依次在多个 BLAST 库上跑 blastn：
-    - 保留各库原始 BLAST 表：{out_prefix}.<group>.blast.tsv
-    - 合并所有库命中到一个大表：{out_prefix}.all_hits.tsv
-    - 基于所有命中按 group + kingdom + species 统计：
-      {out_prefix}.summary_by_species.tsv 和 {out_prefix}.taxonomy_report.tsv
+For non-human reads, run blastn sequentially across multiple blast database:
+    - Retain original blast tables 4 each database
+    - Merge all hits from all databases into one large table
+    - Generate statistics based on all hits grouped by group & kingdom & species
+
+Author: lyra Liu
 """
 
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Optional, Callable, Tuple, Set, List
-import re   # <<< 新增：用于清洗 147573_Piedraia_hortae 这类名字
-
+import re
 from utils import run_cmd, Timer
 
 
-# ======================================================================
-# 新增：把 147573_Piedraia_hortae -> Piedraia hortae 之类的“干净物种名”
-# ======================================================================
 def _normalize_species_name(raw_unit: str, orig_header: str, fallback: str) -> str:
     """
-    根据 idmap 中的 unit / orig_header / sseqid 生成“干净”的物种名。
+    Generate clean species names based on the unit, orig_header, sseqid fields in the idmap.
 
-    优先级：
-      1) unit（例如 147573_Piedraia_hortae）
-      2) orig_header 的第一个 token
-      3) fallback（通常是 sseqid）
+    Priority:
+      1) unit (e.g., 147573_Piedraia_hortae)
+      2) first token of orig_header
+      3) fallback (sseqid)
 
-    规则：
-      - 若形如 "数字_后缀"，去掉前面的数字和下划线；
-      - 把剩余的 "_" 换成空格。
+    Rules:
+      - If the pattern is "numer_fuffix", remove the preceding number & underscore
+      - Replace the remaining "_" with spaces
     """
     name = raw_unit or (orig_header.split()[0] if orig_header else fallback)
     name = name.strip()
     if not name:
         return "Unknown"
 
-    # 去掉数字前缀：147573_Piedraia_hortae -> Piedraia_hortae
+    # Remove the numerical prefix: 147573_Piedraia_hortae -> Piedraia_hortae
     m = re.match(r"^(\d+)_([A-Za-z].*)$", name)
     if m:
         name = m.group(2)
 
-    # 把剩余的 "_" 改成空格：Piedraia_hortae -> Piedraia hortae
+    # Replace the remaining "_" with spaces: Piedraia_hortae -> Piedraia hortae
     return name.replace("_", " ")
 
 
@@ -55,23 +52,19 @@ def run_multi_db_blast(
     blastn: str = "blastn",
     threads: int = 8,
     task: str = "megablast",
-    evalue: float = 1e-10,        # 传给 blastn 的 -evalue 上限
+    evalue: float = 1e-10,
     max_target_seqs: int = 1,
     idmap_root: Optional[str] = None,
     logger: Optional[Callable[[str], None]] = None,
     top_n: int = 20,
-    # ====== 新增：命中筛选阈值 ======
-    min_pident: float = 85.0,     # 最小相似度（%）
-    min_align_len: int = 80,      # 最短对齐长度（bp）
-    max_hit_evalue: float = 1e-20 # 命中 e-value 上限
+    # ===== Hit filter threshold ====
+    min_pident: float = 85.0,     # minimum similarity (%)
+    min_align_len: int = 80,      # minimum alignment length (bp)
+    max_hit_evalue: float = 1e-20 # hit e-value upper limit
 ) -> Dict[str, float]:
     """
-    在多个 BLAST 库上进行比对，并输出所有“符合条件”的命中物种。
-    只有同时满足：
-        pident >= min_pident
-        align_len >= min_align_len
-        evalue <= max_hit_evalue
-    的命中才会进入 all_hits / summary / taxonomy。
+    Perform alignments against multiple blast databases output all "qualifying" hits species.
+    Only hits satisfying all three conditions simultaneously will be included in the final report.
     """
     query = Path(query_fa)
     out_prefix_p = Path(out_prefix)
@@ -80,7 +73,7 @@ def run_multi_db_blast(
 
     timings: Dict[str, float] = {}
     
-    # ==== 预加载 idmap: group -> {short_id -> (category, unit, orig_header)} ====
+    # ==== Preload idmap: group -> {short_id -> (category, unit, orig_header)} ====
     idmaps: Dict[str, Dict[str, Tuple[str, str, str]]] = {}
     if idmap_root is not None:
         id_root = Path(idmap_root)
@@ -96,7 +89,7 @@ def run_multi_db_blast(
                     continue
                 mapping: Dict[str, Tuple[str, str, str]] = {}
                 with open(idmap_path, "r", encoding="utf-8") as f:
-                    header = f.readline()  # 跳过表头: short_id category unit file orig_header
+                    header = f.readline()
                     for line in f:
                         line = line.rstrip("\n")
                         if not line:
@@ -110,12 +103,11 @@ def run_multi_db_blast(
             if logger and idmaps:
                 logger("[INFO] loaded idmap for groups: " + ", ".join(sorted(idmaps.keys())))
 
-    # 合并所有“通过筛选”的命中
+    # Merge all hits that passed the screening
     all_hits_tsv = f"{out_prefix}.all_hits.tsv"
-    # 统计 (group, kingdom, species) -> set(read_id)
+
     species_reads: Dict[Tuple[str, str, str], Set[str]] = {}
 
-    # 这里的 outfmt 不再要 sskingdoms / sscinames，而是自己用 idmap 填物种
     fmt = "6 qseqid sseqid pident length evalue bitscore"
 
     with open(all_hits_tsv, "w", encoding="utf-8") as fout_all:
@@ -123,7 +115,7 @@ def run_multi_db_blast(
             "read_id\tgroup\tkingdom\tspecies\tpident\talign_len\tevalue\tbitscore\n"
         )
 
-        # ========= 1. 依次在多个库上跑 BLAST，边跑边合并 =========
+        # ===== 1. Run blast on multiple databases sequentially, merging results as they r processed. =====
         for group, db_prefix in db_map.items():
             blast_tsv = f"{out_prefix}.{group}.blast.tsv"
             cmd = [
@@ -156,7 +148,7 @@ def run_multi_db_blast(
                         )
                     qseqid, sseqid, pident_s, length_s, evalue_s, bitscore_s = fields[:6]
 
-                    # 数值化
+                    # Numerical representation
                     try:
                         pident = float(pident_s)
                     except ValueError:
@@ -174,41 +166,36 @@ def run_multi_db_blast(
                     except ValueError:
                         bitscore = 0.0
 
-                    # ====== 新增：命中筛选 ======
-                    # 例如：默认 min_pident=85，min_align_len=80，max_hit_evalue=1e-20
-                    # 会把你之前 61 bp 的短命中 / e-value 相对较大的命中过滤掉。
                     if (pident < min_pident) or (alen < min_align_len) or (evalue_f > max_hit_evalue):
                         continue
                         
-                    # === 用 idmap / group 补充 kingdom + 物种名（已经清洗） ===
                     if idmaps:
                         m = idmaps.get(group)
                         if m and sseqid in m:
                             cat2, unit2, orig2 = m[sseqid]
-                            kingdom = (cat2 or group or "Unknown")   # 大类：bacteria/viruses...
+                            kingdom = (cat2 or group or "Unknown")
                             species = _normalize_species_name(unit2, orig2, sseqid)
                         else:
                             kingdom = group
                             species = _normalize_species_name("", "", sseqid)
                     else:
-                        # 没有 idmap，就退化成 group + sseqid 清洗
                         kingdom = group
                         species = _normalize_species_name("", "", sseqid)
 
-                    # 写入 all_hits 表（注意：这里已经是“干净物种名”了）
+                    # Write to the all_hits table.
                     fout_all.write(
                         f"{qseqid}\t{group}\t{kingdom}\t{species}\t"
                         f"{pident:.2f}\t{alen}\t{evalue_f:.2e}\t{bitscore:.1f}\n"
                     )
 
-                    # 用 set 记录每个物种命中的 read_id，用于后面统计 unique_reads
+                    # Use a set to record the read_id 4 each species hit, 4 later counting unique_reads.
                     key = (group, kingdom, species)
                     species_reads.setdefault(key, set()).add(qseqid)
 
             if logger:
                 logger(f"[INFO] lines in {blast_tsv}: {n_lines}")
 
-    # ========= 2. 统计物种：summary_by_species + taxonomy_report =========
+    # ==== 2. Statistical species: summary_by_species + taxonomy_report ====
     summary_tsv   = f"{out_prefix}.summary_by_species.tsv"
     taxonomy_tsv  = f"{out_prefix}.taxonomy_report.tsv"
     sample_name   = out_prefix_p.name
@@ -217,7 +204,7 @@ def run_multi_db_blast(
     group_counts: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
     
     with Timer("summarize", logger) as t:
-        # 根据 unique_reads 排序（命中的 read 数，从高到低）
+        # Sort by unique_reads (number of reads hit, descending order).
         sorted_items = sorted(
             species_reads.items(),
             key=lambda kv: (-len(kv[1]), kv[0][0], kv[0][1], kv[0][2])
@@ -231,7 +218,7 @@ def run_multi_db_blast(
                 fout.write(f"{group}\t{kingdom}\t{species}\t{cnt}\n")
                 group_counts[group].append((species, cnt))
         
-        # 2) taxonomy_report.tsv（每个样本一行，类似 Kraken 风格汇总）
+        # 2) taxonomy_report.tsv
         GROUP_LABEL = {
             "bacteria":   "Bacteria",
             "viruses":    "Viruses",
@@ -244,7 +231,6 @@ def run_multi_db_blast(
         
         with open(taxonomy_tsv, "w", encoding="utf-8") as ftax:
             ftax.write("Sample\tTaxonomy\n")
-            # 按 db_map 里库的顺序来输出，这样 Bacteria / Fungi / Viruses 顺序稳定
             for g in db_map.keys():
                 label = GROUP_LABEL.get(g, g.title())
                 species_list = group_counts.get(g)
@@ -254,17 +240,15 @@ def run_multi_db_blast(
                 else:
                     parts = []
                     for sp, cnt in species_list:
-                        # 这里的 sp 已经是“干净物种名”，例如 "Listeria ivanovii"
                         parts.append(f"{sp}({cnt})")
                     line = f"{label}: " + " | ".join(parts)
 
-                # 写到 taxonomy_report.tsv
+                # Write to taxonomy_report.tsv.
                 ftax.write(f"{sample_name}\t{line}\n")
-                # 同步打印到日志 / 终端
+                # Synchronous printing to log.
                 if logger:
                     logger(f"[TAXONOMY] {sample_name}\t{line}")
 
-        # 额外打印 top N 物种
         if logger:
             total_hits = sum(len(v) for v in species_reads.values())
             logger(f"[INFO] species with >=1 hit: {len(species_reads)}")
