@@ -140,3 +140,42 @@ Process all .bam files under --indir:
     --min-align-len 150 \
     --max-hit-evalue 1e-30 \
     --parallel --jobs 10
+  
+## Parameters:
+  --indir
+  Path to the input directory containing raw sequencing data for all samples (e.g. FASTQ or BAM files). Each file (or file pair) in this directory is treated as one sample by the pipeline.
+
+  --outdir
+  Path to the output directory. All intermediate files and final reports produced by the pipeline will be written here. The directory will be created automatically if it does not exist.
+
+  --human-index
+  Path to the minimap2 index (.mmi) of the human reference genome. Reads that map to this index will be considered host reads and removed in the host-depletion step.
+
+  --db-root
+  Root directory of all microbial classification databases. Under this folder, each group (for example viruses/, bacteria/, fungi/, mycoplasma/) has its own subdirectory and indices used for downstream alignment and classification.
+
+  --db-groups
+  Comma-separated list of database groups to be used for microbial classification, such as viruses,bacteria,fungi,mycoplasma. Each name must match a subdirectory under --db-root. The pipeline will search the remaining (non-human) reads against these groups.
+
+  --threads
+  Total number of CPU threads used for CPU-intensive tasks (mapping, BLAST/classification, etc.). When --parallel is enabled, this is typically the number of threads per sample.
+
+  --preset
+  Minimap2 mapping preset passed directly to minimap2, for example map-hifi, map-ont, or sr. Choose an appropriate preset according to your sequencing platform (HiFi, ONT, short reads, etc.).
+
+  --min-pident
+  Minimum percent identity (0–100) required for an alignment to be considered a valid hit in downstream filtering and classification. Alignments with lower identity are discarded.
+
+  --min-align-len
+  Minimum alignment length in base pairs. Alignments shorter than this threshold are ignored to reduce spurious short matches.
+
+  --max-hit-evalue
+  Maximum allowed e-value for database hits (e.g. from BLAST or similar tools). Only hits with e-value less than or equal to this threshold are kept as high-confidence matches.
+
+  --parallel
+  Flag to enable multi-sample parallel processing. When this flag is present, the pipeline will process multiple samples in parallel rather than sequentially.
+
+  --jobs
+  Number of samples to process in parallel when --parallel is enabled. For example, --jobs 10 allows up to ten samples to run concurrently.
+
+  Note that the product of --threads and --jobs should not greatly exceed the total number of CPU cores available on your system; otherwise, oversubscription may hurt performance instead of speeding up the pipeline.
